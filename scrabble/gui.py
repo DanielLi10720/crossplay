@@ -77,6 +77,8 @@ else:
                 [None] * BOARD_SIZE for _ in range(BOARD_SIZE)
             ]
             self._preview_tiles: Dict[Tuple[int, int], NewTile] = {}
+            self._player_scores: List[int] = [0, 0]
+            self._active_player: int = 0  # 0 = P1, 1 = P2
 
             default_lex = Path(__file__).resolve().parent.parent / "data" / "sample_words.txt"
             self._lexicon_path = str(default_lex) if default_lex.exists() else ""
@@ -136,6 +138,11 @@ else:
             self._preview_score_label = QLabel("Preview: —")
             self._preview_score_label.setMinimumWidth(220)
             tb.addWidget(self._preview_score_label)
+
+            self._score_turn_label = QLabel()
+            self._score_turn_label.setMinimumWidth(260)
+            tb.addWidget(self._score_turn_label)
+            self._refresh_score_turn_label()
 
             commit_btn = QPushButton("Commit play")
             commit_btn.clicked.connect(self._commit_preview)
@@ -332,6 +339,11 @@ else:
                 short = out if len(out) <= 40 else out[:37] + "…"
                 self._preview_score_label.setText(f"Preview: — ({short})")
 
+        def _refresh_score_turn_label(self) -> None:
+            p1, p2 = self._player_scores[0], self._player_scores[1]
+            turn_n = self._active_player + 1
+            self._score_turn_label.setText(f"P1: {p1} | P2: {p2} | Turn: P{turn_n}")
+
         def _consume_rack_after_play(self, tiles: Sequence[NewTile]) -> None:
             chars: List[str] = []
             for c in self._rack_edit.text().upper().replace(" ", ""):
@@ -375,6 +387,9 @@ else:
             tiles_merged = out.new_tiles
             self._preview_tiles.clear()
             self._consume_rack_after_play(tiles_merged)
+            self._player_scores[self._active_player] += out.score
+            self._active_player = 1 - self._active_player
+            self._refresh_score_turn_label()
             self._refresh_board_display()
 
         def _cancel_preview(self) -> None:
@@ -427,6 +442,9 @@ else:
                 for c in range(BOARD_SIZE):
                     self._committed_letters[r][c] = None
             self._preview_tiles.clear()
+            self._player_scores = [0, 0]
+            self._active_player = 0
+            self._refresh_score_turn_label()
             self._refresh_board_display()
 
         def _reset_premiums(self) -> None:
@@ -507,6 +525,8 @@ else:
                 "bonuses": bonuses,
                 "rack": self._rack_edit.text(),
                 "lexicon": self._lexicon_path,
+                "scores": list(self._player_scores),
+                "active_player": self._active_player,
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -548,6 +568,24 @@ else:
                                 it.setBackground(_bonus_brush_for_label(BONUS_LABELS[lab_i]))
             finally:
                 self._board_updating = False
+            raw_scores = data.get("scores")
+            if isinstance(raw_scores, list) and len(raw_scores) >= 2:
+                try:
+                    self._player_scores = [int(raw_scores[0]), int(raw_scores[1])]
+                except (TypeError, ValueError):
+                    self._player_scores = [0, 0]
+            else:
+                self._player_scores = [0, 0]
+            ap_raw = data.get("active_player")
+            if ap_raw is not None:
+                try:
+                    ai = int(ap_raw)
+                    self._active_player = ai if ai in (0, 1) else 0
+                except (TypeError, ValueError):
+                    self._active_player = 0
+            else:
+                self._active_player = 0
+            self._refresh_score_turn_label()
             if "rack" in data:
                 self._rack_edit.setText(str(data["rack"]))
             if data.get("lexicon"):
