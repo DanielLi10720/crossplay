@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -11,10 +12,13 @@ from typing import List, Optional
 
 from scrabble.board import BOARD_SIZE, Bonus, Board, default_bonuses, normalize_board_letter, rack_from_string
 from scrabble.gaddag import Gaddag, load_words_from_file
-from scrabble.move_gen import find_moves
+from scrabble.move_gen import Play, find_moves
 
 # Index matches Bonus enum value 0..5
 BONUS_LABELS = ("Normal", "DL", "TL", "DW", "TW", "Star")
+
+# Vertical offset so row-0 premium combobox fits above the letter cell
+BOARD_TOP_PAD = 22
 
 
 def _bonus_bg(label: str) -> str:
@@ -25,12 +29,69 @@ def _bonus_bg(label: str) -> str:
 
 class ScrabbleGui:
     def __init__(self) -> None:
-        self.root = tk.Tk()
+        # #region agent log
+        _ts = int(__import__("time").time() * 1000)
+        _disp = os.environ.get("DISPLAY")
+        _dbg = {
+            "H1_DISPLAY_missing": not _disp,
+            "H2_ssh_without_DISPLAY": bool(os.environ.get("SSH_CONNECTION")) and not _disp,
+            "H3_wayland_but_no_DISPLAY": bool(os.environ.get("WAYLAND_DISPLAY")) and not _disp,
+            "H4_stdin_is_tty": __import__("sys").stdin.isatty(),
+            "H5_XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE"),
+            "DISPLAY_repr": repr(_disp)[:120],
+            "WAYLAND_DISPLAY_repr": repr(os.environ.get("WAYLAND_DISPLAY"))[:120],
+        }
+        _lp = Path("/home/dl4247/crossplay/.cursor/debug-b6cda5.log")
+        _lp.parent.mkdir(parents=True, exist_ok=True)
+        _lp.open("a", encoding="utf-8").write(
+            json.dumps(
+                {
+                    "sessionId": "b6cda5",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1-H5",
+                    "location": "scrabble/gui.py:ScrabbleGui.__init__:preTk",
+                    "message": "probe before Tk()",
+                    "data": _dbg,
+                    "timestamp": _ts,
+                }
+            )
+            + "\n"
+        )
+        # #endregion
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            # #region agent log
+            _ts_e = int(__import__("time").time() * 1000)
+            _lp.open("a", encoding="utf-8").write(
+                json.dumps(
+                    {
+                        "sessionId": "b6cda5",
+                        "runId": "post-fix",
+                        "hypothesisId": "TclExit",
+                        "location": "scrabble/gui.py:ScrabbleGui.__init__:Tk TclError",
+                        "message": "Tk() failed; exiting with guidance",
+                        "data": {"tcl_error": str(exc)[:200]},
+                        "timestamp": _ts_e,
+                    }
+                )
+                + "\n"
+            )
+            # #endregion
+            sys.stderr.write(
+                "scrabble-gui needs a GUI display (X11/Wayland). Tkinter reported:\n"
+                f"  {exc}\n\n"
+                "If you are on SSH, reconnect with X11 forwarding (e.g. ssh -Y …) or set DISPLAY to your desktop session.\n"
+                "On a machine with no display, try: xvfb-run -a scrabble-gui\n"
+            )
+            raise SystemExit(1) from exc
         self.root.title("Scrabble move finder")
         self.root.geometry("1150x760")
 
         self.gaddag: Optional[Gaddag] = None
         self.word_set: set[str] = set()
+        self._plays_cache: List[Play] = []
+        self._snapshot_letters: Optional[List[List[Optional[str]]]] = None
 
         default_lex = Path(__file__).resolve().parent.parent / "data" / "sample_words.txt"
         self.lexicon_path = tk.StringVar(value=str(default_lex) if default_lex.exists() else "")
@@ -81,7 +142,11 @@ class ScrabbleGui:
 
         canvas_holder = tk.Frame(grid_fr)
         canvas_holder.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(canvas_holder, width=30 * BOARD_SIZE + 40, height=26 * BOARD_SIZE + 20)
+        canvas = tk.Canvas(
+            canvas_holder,
+            width=30 * BOARD_SIZE + 40,
+            height=BOARD_TOP_PAD + 34 * BOARD_SIZE + 36,
+        )
         vs = ttk.Scrollbar(canvas_holder, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=vs.set)
         vs.pack(side=tk.RIGHT, fill=tk.Y)
@@ -91,8 +156,9 @@ class ScrabbleGui:
         self._bonus_vars: List[List[tk.StringVar]] = []
         base = default_bonuses()
         cell_w, cell_h = 34, 34
+        y_off = BOARD_TOP_PAD
         for r in range(BOARD_SIZE):
-            tk.Label(canvas, text=str(r + 1), width=2).place(x=4, y=16 + r * cell_h)
+            tk.Label(canvas, text=str(r + 1), width=2).place(x=4, y=y_off + 16 + r * cell_h)
             row_e: List[tk.Entry] = []
             row_sv: List[tk.StringVar] = []
             for c in range(BOARD_SIZE):
@@ -100,9 +166,6 @@ class ScrabbleGui:
                 label = BONUS_LABELS[int(bcell)]
                 sv = tk.StringVar(value=label)
                 row_sv.append(sv)
-                ent = tk.Entry(canvas, width=2, justify="center", relief=tk.FLAT, bd=1)
-                ent.place(x=28 + c * cell_w, y=12 + r * cell_h, width=22, height=22)
-                ent.configure(bg=_bonus_bg(label))
                 cb = ttk.Combobox(
                     canvas,
                     textvariable=sv,
@@ -111,7 +174,10 @@ class ScrabbleGui:
                     state="readonly",
                     font=("TkDefaultFont", 7),
                 )
-                cb.place(x=22 + c * cell_w, y=30 + r * cell_h, width=cell_w - 2, height=18)
+                cb.place(x=22 + c * cell_w, y=y_off + 2 + r * cell_h, width=cell_w - 2, height=18)
+                ent = tk.Entry(canvas, width=2, justify="center", relief=tk.FLAT, bd=1)
+                ent.place(x=28 + c * cell_w, y=y_off + 20 + r * cell_h, width=22, height=22)
+                ent.configure(bg=_bonus_bg(label))
 
                 def make_sel(e: tk.Entry = ent, svar: tk.StringVar = sv):
                     def _on(_evt=None) -> None:
@@ -140,6 +206,7 @@ class ScrabbleGui:
         self.tree.configure(yscrollcommand=tvsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tvsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self._preview_selected_move)
 
         self._load_lexicon_silent()
         self._reset_premiums()
@@ -213,11 +280,42 @@ class ScrabbleGui:
             messagebox.showwarning("Rack", "Enter rack letters (use ? for blanks).")
             return
         plays = find_moves(board, rack, self.gaddag, self.word_set, top_n=topn)
+        self._snapshot_letters = [[board.letters[r][c] for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
+        self._plays_cache = plays
         for i in self.tree.get_children():
             self.tree.delete(i)
         for p in plays:
             self.tree.insert("", tk.END, values=(p.score, p.summary(), p.detail()))
         self.status_var.set(f"{len(plays)} moves (cap {topn})")
+
+    def _preview_selected_move(self, _evt: Optional[tk.Event] = None) -> None:
+        if not self._plays_cache or self._snapshot_letters is None:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        try:
+            idx = self.tree.index(sel[0])
+        except tk.TclError:
+            return
+        if idx < 0 or idx >= len(self._plays_cache):
+            return
+        play = self._plays_cache[idx]
+        snap = self._snapshot_letters
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                ent = self._letter_entries[r][c]
+                ent.delete(0, tk.END)
+                ch = snap[r][c]
+                if ch:
+                    ent.insert(0, ch)
+        for nt in play.new_tiles:
+            ch_disp = nt.ch.lower() if nt.from_blank else nt.ch
+            ent = self._letter_entries[nt.r][nt.c]
+            ent.delete(0, tk.END)
+            ent.insert(0, ch_disp)
+            lab = self._bonus_vars[nt.r][nt.c].get()
+            ent.configure(bg=_bonus_bg(lab))
 
     def _save_state(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
