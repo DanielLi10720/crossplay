@@ -1,379 +1,588 @@
-"""Tkinter GUI for the Scrabble move finder."""
+"""Qt (PySide6) GUI for the Scrabble move finder."""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from scrabble.board import BOARD_SIZE, Bonus, Board, default_bonuses, normalize_board_letter, rack_from_string
+from scrabble.board import (
+    BOARD_SIZE,
+    Bonus,
+    Board,
+    default_bonuses,
+    normalize_board_letter,
+    rack_from_string,
+)
 from scrabble.gaddag import Gaddag, load_words_from_file
 from scrabble.move_gen import Play, find_moves
+from scrabble.play_validate import ValidatedPlay, validate_manual_play
+from scrabble.score import NewTile
 
-# Index matches Bonus enum value 0..5
-BONUS_LABELS = ("Normal", "DL", "TL", "DW", "TW", "Star")
+try:
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
+    from PySide6.QtWidgets import (
+        QApplication,
+        QFileDialog,
+        QGroupBox,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMenu,
+        QMessageBox,
+        QPushButton,
+        QSpinBox,
+        QSplitter,
+        QStatusBar,
+        QTableWidget,
+        QTableWidgetItem,
+        QToolBar,
+        QVBoxLayout,
+    )
+except ImportError as _import_err:  # pragma: no cover - exercised when PySide6 missing
+    _PYSIDE_IMPORT_ERROR: Optional[ImportError] = _import_err
+    ScrabbleMainWindow = None
+else:
+    _PYSIDE_IMPORT_ERROR = None
 
-# Vertical offset so row-0 premium combobox fits above the letter cell
-BOARD_TOP_PAD = 22
+    # Index matches Bonus enum value 0..5
+    BONUS_LABELS = ("Normal", "DL", "TL", "DW", "TW", "Star")
 
+    def _bonus_hex(index: int) -> str:
+        styles = ("#f5f5f5", "#c8e6c9", "#66bb6a", "#ffccbc", "#ff7043", "#ffe082")
+        if 0 <= index < len(styles):
+            return styles[index]
+        return styles[0]
 
-def _bonus_bg(label: str) -> str:
-    idx = BONUS_LABELS.index(label) if label in BONUS_LABELS else 0
-    styles = ("#f5f5f5", "#c8e6c9", "#66bb6a", "#ffccbc", "#ff7043", "#ffe082")
-    return styles[idx]
+    def _bonus_brush_for_label(label: str) -> QBrush:
+        idx = BONUS_LABELS.index(label) if label in BONUS_LABELS else 0
+        return QBrush(QColor(_bonus_hex(idx)))
 
+    class ScrabbleMainWindow(QMainWindow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowTitle("Scrabble move finder")
+            self.resize(1150, 760)
 
-class ScrabbleGui:
-    def __init__(self) -> None:
-        # #region agent log
-        _ts = int(__import__("time").time() * 1000)
-        _disp = os.environ.get("DISPLAY")
-        _dbg = {
-            "H1_DISPLAY_missing": not _disp,
-            "H2_ssh_without_DISPLAY": bool(os.environ.get("SSH_CONNECTION")) and not _disp,
-            "H3_wayland_but_no_DISPLAY": bool(os.environ.get("WAYLAND_DISPLAY")) and not _disp,
-            "H4_stdin_is_tty": __import__("sys").stdin.isatty(),
-            "H5_XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE"),
-            "DISPLAY_repr": repr(_disp)[:120],
-            "WAYLAND_DISPLAY_repr": repr(os.environ.get("WAYLAND_DISPLAY"))[:120],
-        }
-        _lp = Path("/home/dl4247/crossplay/.cursor/debug-b6cda5.log")
-        _lp.parent.mkdir(parents=True, exist_ok=True)
-        _lp.open("a", encoding="utf-8").write(
-            json.dumps(
-                {
-                    "sessionId": "b6cda5",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H1-H5",
-                    "location": "scrabble/gui.py:ScrabbleGui.__init__:preTk",
-                    "message": "probe before Tk()",
-                    "data": _dbg,
-                    "timestamp": _ts,
-                }
-            )
-            + "\n"
-        )
-        # #endregion
-        try:
-            self.root = tk.Tk()
-        except tk.TclError as exc:
-            # #region agent log
-            _ts_e = int(__import__("time").time() * 1000)
-            _lp.open("a", encoding="utf-8").write(
-                json.dumps(
-                    {
-                        "sessionId": "b6cda5",
-                        "runId": "post-fix",
-                        "hypothesisId": "TclExit",
-                        "location": "scrabble/gui.py:ScrabbleGui.__init__:Tk TclError",
-                        "message": "Tk() failed; exiting with guidance",
-                        "data": {"tcl_error": str(exc)[:200]},
-                        "timestamp": _ts_e,
-                    }
-                )
-                + "\n"
-            )
-            # #endregion
-            sys.stderr.write(
-                "scrabble-gui needs a GUI display (X11/Wayland). Tkinter reported:\n"
-                f"  {exc}\n\n"
-                "If you are on SSH, reconnect with X11 forwarding (e.g. ssh -Y …) or set DISPLAY to your desktop session.\n"
-                "On a machine with no display, try: xvfb-run -a scrabble-gui\n"
-            )
-            raise SystemExit(1) from exc
-        self.root.title("Scrabble move finder")
-        self.root.geometry("1150x760")
+            self.gaddag: Optional[Gaddag] = None
+            self.word_set: set[str] = set()
+            self._plays_cache: List[Play] = []
+            self._snapshot_letters: Optional[List[List[Optional[str]]]] = None
+            self._board_updating = False
+            self._committed_letters: List[List[Optional[str]]] = [
+                [None] * BOARD_SIZE for _ in range(BOARD_SIZE)
+            ]
+            self._preview_tiles: Dict[Tuple[int, int], NewTile] = {}
 
-        self.gaddag: Optional[Gaddag] = None
-        self.word_set: set[str] = set()
-        self._plays_cache: List[Play] = []
-        self._snapshot_letters: Optional[List[List[Optional[str]]]] = None
+            default_lex = Path(__file__).resolve().parent.parent / "data" / "sample_words.txt"
+            self._lexicon_path = str(default_lex) if default_lex.exists() else ""
 
-        default_lex = Path(__file__).resolve().parent.parent / "data" / "sample_words.txt"
-        self.lexicon_path = tk.StringVar(value=str(default_lex) if default_lex.exists() else "")
-        self.rack_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Load a lexicon to begin.")
+            self._build_menu()
+            self._build_toolbar()
+            self._build_central()
 
-        top = ttk.Frame(self.root, padding=6)
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="Lexicon:").pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.lexicon_path, width=48).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Browse…", command=self._browse_lexicon).pack(side=tk.LEFT)
-        ttk.Button(top, text="Load lexicon", command=self._load_lexicon).pack(side=tk.LEFT, padx=4)
+            self._default_bonuses = [
+                [default_bonuses()[r][c] for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)
+            ]
 
-        rack_fr = ttk.Frame(self.root, padding=(6, 0))
-        rack_fr.pack(fill=tk.X)
-        ttk.Label(rack_fr, text="Rack (A–Z, ? blank):").pack(side=tk.LEFT)
-        ttk.Entry(rack_fr, textvariable=self.rack_var, width=18).pack(side=tk.LEFT, padx=4)
-        ttk.Label(rack_fr, text="Top N:").pack(side=tk.LEFT, padx=(14, 0))
-        self.topn_var = tk.StringVar(value="50")
-        ttk.Entry(rack_fr, textvariable=self.topn_var, width=5).pack(side=tk.LEFT, padx=4)
-
-        btn_fr = ttk.Frame(self.root, padding=6)
-        btn_fr.pack(fill=tk.X)
-        ttk.Button(btn_fr, text="Find moves", command=self._find_moves).pack(side=tk.LEFT)
-        ttk.Button(btn_fr, text="Clear letters", command=self._clear_letters).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_fr, text="Reset premiums", command=self._reset_premiums).pack(side=tk.LEFT)
-        ttk.Button(btn_fr, text="Save JSON…", command=self._save_state).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_fr, text="Load JSON…", command=self._load_state).pack(side=tk.LEFT)
-
-        ttk.Label(self.root, textvariable=self.status_var).pack(fill=tk.X, padx=8, pady=4)
-
-        pan = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        pan.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-
-        left = ttk.Frame(pan, width=540)
-        right = ttk.Frame(pan, width=540)
-        pan.add(left, weight=2)
-        pan.add(right, weight=1)
-
-        grid_fr = ttk.LabelFrame(left, text="Board (lowercase = blank played as that letter)")
-        grid_fr.pack(fill=tk.BOTH, expand=True)
-
-        head = tk.Frame(grid_fr)
-        head.pack()
-        tk.Label(head, text="", width=1).grid(row=0, column=0)
-        for c in range(BOARD_SIZE):
-            tk.Label(head, text=chr(ord("A") + c), width=3).grid(row=0, column=1 + c)
-
-        canvas_holder = tk.Frame(grid_fr)
-        canvas_holder.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(
-            canvas_holder,
-            width=30 * BOARD_SIZE + 40,
-            height=BOARD_TOP_PAD + 34 * BOARD_SIZE + 36,
-        )
-        vs = ttk.Scrollbar(canvas_holder, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vs.set)
-        vs.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._letter_entries: List[List[tk.Entry]] = []
-        self._bonus_vars: List[List[tk.StringVar]] = []
-        base = default_bonuses()
-        cell_w, cell_h = 34, 34
-        y_off = BOARD_TOP_PAD
-        for r in range(BOARD_SIZE):
-            tk.Label(canvas, text=str(r + 1), width=2).place(x=4, y=y_off + 16 + r * cell_h)
-            row_e: List[tk.Entry] = []
-            row_sv: List[tk.StringVar] = []
-            for c in range(BOARD_SIZE):
-                bcell = base[r][c]
-                label = BONUS_LABELS[int(bcell)]
-                sv = tk.StringVar(value=label)
-                row_sv.append(sv)
-                cb = ttk.Combobox(
-                    canvas,
-                    textvariable=sv,
-                    values=BONUS_LABELS,
-                    width=5,
-                    state="readonly",
-                    font=("TkDefaultFont", 7),
-                )
-                cb.place(x=22 + c * cell_w, y=y_off + 2 + r * cell_h, width=cell_w - 2, height=18)
-                ent = tk.Entry(canvas, width=2, justify="center", relief=tk.FLAT, bd=1)
-                ent.place(x=28 + c * cell_w, y=y_off + 20 + r * cell_h, width=22, height=22)
-                ent.configure(bg=_bonus_bg(label))
-
-                def make_sel(e: tk.Entry = ent, svar: tk.StringVar = sv):
-                    def _on(_evt=None) -> None:
-                        e.configure(bg=_bonus_bg(svar.get()))
-
-                    return _on
-
-                cb.bind("<<ComboboxSelected>>", make_sel())
-                row_e.append(ent)
-            self._letter_entries.append(row_e)
-            self._bonus_vars.append(row_sv)
-
-        self._default_bonuses = [[base[r][c] for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
-
-        res_fr = ttk.LabelFrame(right, text="Top moves")
-        res_fr.pack(fill=tk.BOTH, expand=True)
-        cols = ("score", "summary", "detail")
-        self.tree = ttk.Treeview(res_fr, columns=cols, show="headings", height=24)
-        self.tree.heading("score", text="Score")
-        self.tree.heading("summary", text="Play")
-        self.tree.heading("detail", text="Detail")
-        self.tree.column("score", width=50, anchor="e")
-        self.tree.column("summary", width=170, anchor="w")
-        self.tree.column("detail", width=380, anchor="w")
-        tvsb = ttk.Scrollbar(res_fr, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tvsb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tvsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<<TreeviewSelect>>", self._preview_selected_move)
-
-        self._load_lexicon_silent()
-        self._reset_premiums()
-
-    def _browse_lexicon(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All", "*.*")])
-        if p:
-            self.lexicon_path.set(p)
-
-    def _load_lexicon_silent(self) -> None:
-        path = self.lexicon_path.get().strip()
-        if not path or not os.path.isfile(path):
-            self.status_var.set("Lexicon path missing or not a file.")
-            return
-        try:
-            self.gaddag = Gaddag.from_file(path)
-            self.word_set = load_words_from_file(path)
-            self.status_var.set(f"Loaded {len(self.word_set)} words from {path}")
-        except OSError as e:
-            self.status_var.set(f"Lexicon error: {e}")
-
-    def _load_lexicon(self) -> None:
-        self._load_lexicon_silent()
-        messagebox.showinfo("Lexicon", self.status_var.get())
-
-    def _board_from_ui(self) -> Board:
-        b = Board()
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                txt = self._letter_entries[r][c].get().strip()
-                if txt:
-                    txt = txt[0]
-                    self._letter_entries[r][c].delete(0, tk.END)
-                    self._letter_entries[r][c].insert(0, txt)
-                try:
-                    b.letters[r][c] = normalize_board_letter(txt)
-                except ValueError as e:
-                    raise ValueError(f"Cell ({r+1},{chr(ord('A')+c)}): {e}") from e
-                name = self._bonus_vars[r][c].get()
-                idx = BONUS_LABELS.index(name) if name in BONUS_LABELS else 0
-                b.bonuses[r][c] = Bonus(idx)
-        return b
-
-    def _clear_letters(self) -> None:
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                self._letter_entries[r][c].delete(0, tk.END)
-
-    def _reset_premiums(self) -> None:
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                lab = BONUS_LABELS[int(self._default_bonuses[r][c])]
-                self._bonus_vars[r][c].set(lab)
-                self._letter_entries[r][c].configure(bg=_bonus_bg(lab))
-
-    def _find_moves(self) -> None:
-        if self.gaddag is None or not self.word_set:
-            messagebox.showwarning("Lexicon", "Load a lexicon first.")
-            return
-        try:
-            board = self._board_from_ui()
-        except ValueError as e:
-            messagebox.showerror("Board", str(e))
-            return
-        try:
-            topn = max(1, min(500, int(self.topn_var.get().strip())))
-        except ValueError:
-            topn = 50
-        rack = rack_from_string(self.rack_var.get())
-        if not rack:
-            messagebox.showwarning("Rack", "Enter rack letters (use ? for blanks).")
-            return
-        plays = find_moves(board, rack, self.gaddag, self.word_set, top_n=topn)
-        self._snapshot_letters = [[board.letters[r][c] for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
-        self._plays_cache = plays
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        for p in plays:
-            self.tree.insert("", tk.END, values=(p.score, p.summary(), p.detail()))
-        self.status_var.set(f"{len(plays)} moves (cap {topn})")
-
-    def _preview_selected_move(self, _evt: Optional[tk.Event] = None) -> None:
-        if not self._plays_cache or self._snapshot_letters is None:
-            return
-        sel = self.tree.selection()
-        if not sel:
-            return
-        try:
-            idx = self.tree.index(sel[0])
-        except tk.TclError:
-            return
-        if idx < 0 or idx >= len(self._plays_cache):
-            return
-        play = self._plays_cache[idx]
-        snap = self._snapshot_letters
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                ent = self._letter_entries[r][c]
-                ent.delete(0, tk.END)
-                ch = snap[r][c]
-                if ch:
-                    ent.insert(0, ch)
-        for nt in play.new_tiles:
-            ch_disp = nt.ch.lower() if nt.from_blank else nt.ch
-            ent = self._letter_entries[nt.r][nt.c]
-            ent.delete(0, tk.END)
-            ent.insert(0, ch_disp)
-            lab = self._bonus_vars[nt.r][nt.c].get()
-            ent.configure(bg=_bonus_bg(lab))
-
-    def _save_state(self) -> None:
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            b = self._board_from_ui()
-        except ValueError as e:
-            messagebox.showerror("Board", str(e))
-            return
-        letters = [[b.letters[r][c] for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
-        bonuses = [[int(b.bonuses[r][c]) for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
-        data = {
-            "letters": letters,
-            "bonuses": bonuses,
-            "rack": self.rack_var.get(),
-            "lexicon": self.lexicon_path.get(),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        messagebox.showinfo("Saved", path)
-
-    def _load_state(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All", "*.*")])
-        if not path or not os.path.isfile(path):
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        letters = data.get("letters")
-        bonuses = data.get("bonuses")
-        if not isinstance(letters, list):
-            messagebox.showerror("Load", "Invalid file")
-            return
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                self._letter_entries[r][c].delete(0, tk.END)
-                ch = letters[r][c]
-                if ch:
-                    self._letter_entries[r][c].insert(0, str(ch))
-                if isinstance(bonuses, list) and bonuses[r][c] is not None:
-                    bi = int(bonuses[r][c])
-                    lab_bonus = BONUS_LABELS[bi] if 0 <= bi < len(BONUS_LABELS) else "Normal"
-                    self._bonus_vars[r][c].set(lab_bonus)
-                lab = self._bonus_vars[r][c].get()
-                self._letter_entries[r][c].configure(bg=_bonus_bg(lab))
-        if "rack" in data:
-            self.rack_var.set(str(data["rack"]))
-        if data.get("lexicon"):
-            self.lexicon_path.set(str(data["lexicon"]))
             self._load_lexicon_silent()
-        messagebox.showinfo("Loaded", path)
+            self._reset_premiums()
+            self._refresh_board_display()
 
-    def run(self) -> None:
-        self.root.mainloop()
+        def _build_menu(self) -> None:
+            file_m = self.menuBar().addMenu("&File")
+            file_m.addAction("Open &lexicon…", self._open_lexicon_dialog, QKeySequence.StandardKey.Open)
+            file_m.addSeparator()
+            file_m.addAction("&Save board JSON…", self._save_state)
+            file_m.addAction("&Load board JSON…", self._load_state)
+            file_m.addSeparator()
+            file_m.addAction("&Quit", self.close, QKeySequence.StandardKey.Quit)
+
+            board_m = self.menuBar().addMenu("&Board")
+            board_m.addAction("Clear &letters", self._clear_letters)
+            board_m.addAction("&Reset premiums", self._reset_premiums)
+
+        def _build_toolbar(self) -> None:
+            tb = QToolBar()
+            tb.setMovable(False)
+            self.addToolBar(tb)
+
+            self._lex_label = QLabel()
+            self._lex_label.setMinimumWidth(180)
+            tb.addWidget(self._lex_label)
+            self._sync_lex_label()
+
+            tb.addWidget(QLabel("Rack:"))
+            self._rack_edit = QLineEdit()
+            self._rack_edit.setPlaceholderText("A–Z, ? blank")
+            self._rack_edit.setMaximumWidth(140)
+            tb.addWidget(self._rack_edit)
+
+            tb.addWidget(QLabel("Top N:"))
+            self._topn_spin = QSpinBox()
+            self._topn_spin.setRange(1, 500)
+            self._topn_spin.setValue(50)
+            self._topn_spin.setMaximumWidth(70)
+            tb.addWidget(self._topn_spin)
+
+            find_btn = QPushButton("Find moves")
+            find_btn.clicked.connect(self._find_moves)
+            tb.addWidget(find_btn)
+
+            self._preview_score_label = QLabel("Preview: —")
+            self._preview_score_label.setMinimumWidth(220)
+            tb.addWidget(self._preview_score_label)
+
+            commit_btn = QPushButton("Commit play")
+            commit_btn.clicked.connect(self._commit_preview)
+            tb.addWidget(commit_btn)
+            cancel_prev_btn = QPushButton("Cancel preview")
+            cancel_prev_btn.clicked.connect(self._cancel_preview)
+            tb.addWidget(cancel_prev_btn)
+
+            self.setStatusBar(QStatusBar())
+            self.statusBar().showMessage("Load a lexicon to begin.")
+
+            self._rack_edit.textChanged.connect(self._on_rack_text_changed)
+
+        def _build_central(self) -> None:
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+
+            left_box = QGroupBox(
+                "Board — bold = preview; empty squares build preview; "
+                "occupied = committed (setup); right-click = premium"
+            )
+            left_l = QVBoxLayout(left_box)
+            self._board_table = QTableWidget(BOARD_SIZE, BOARD_SIZE)
+            self._board_table.setHorizontalHeaderLabels(
+                [chr(ord("A") + c) for c in range(BOARD_SIZE)]
+            )
+            self._board_table.setVerticalHeaderLabels([str(r + 1) for r in range(BOARD_SIZE)])
+            hdr_h = self._board_table.horizontalHeader()
+            hdr_h.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            hdr_v = self._board_table.verticalHeader()
+            hdr_v.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            cell = 32
+            for i in range(BOARD_SIZE):
+                self._board_table.setColumnWidth(i, cell)
+                self._board_table.setRowHeight(i, cell)
+            self._board_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._board_table.customContextMenuRequested.connect(self._board_context_menu)
+            self._board_table.itemChanged.connect(self._on_board_item_changed)
+            left_l.addWidget(self._board_table)
+            splitter.addWidget(left_box)
+
+            right_box = QGroupBox("Top moves")
+            right_l = QVBoxLayout(right_box)
+            self._moves_table = QTableWidget(0, 3)
+            self._moves_table.setHorizontalHeaderLabels(["Score", "Play", "Detail"])
+            self._moves_table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.ResizeToContents
+            )
+            self._moves_table.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeMode.ResizeToContents
+            )
+            self._moves_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            self._moves_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            self._moves_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+            self._moves_table.itemSelectionChanged.connect(self._preview_selected_move)
+            right_l.addWidget(self._moves_table)
+            splitter.addWidget(right_box)
+
+            splitter.setStretchFactor(0, 2)
+            splitter.setStretchFactor(1, 1)
+            self.setCentralWidget(splitter)
+
+            self._init_board_cells()
+
+        def _init_board_cells(self) -> None:
+            self._board_updating = True
+            try:
+                base = default_bonuses()
+                for r in range(BOARD_SIZE):
+                    for c in range(BOARD_SIZE):
+                        lab_idx = int(base[r][c])
+                        it = QTableWidgetItem("")
+                        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        it.setData(Qt.ItemDataRole.UserRole, lab_idx)
+                        it.setBackground(_bonus_brush_for_label(BONUS_LABELS[lab_idx]))
+                        flags = (
+                            Qt.ItemFlag.ItemIsEnabled
+                            | Qt.ItemFlag.ItemIsSelectable
+                            | Qt.ItemFlag.ItemIsEditable
+                        )
+                        it.setFlags(flags)
+                        self._board_table.setItem(r, c, it)
+            finally:
+                self._board_updating = False
+
+        def _sync_lex_label(self) -> None:
+            p = self._lexicon_path.strip()
+            if p:
+                self._lex_label.setText(f"Lexicon: {Path(p).name}")
+                self._lex_label.setToolTip(p)
+            else:
+                self._lex_label.setText("Lexicon: —")
+                self._lex_label.setToolTip("")
+
+        def _open_lexicon_dialog(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open lexicon", "", "Text (*.txt);;All (*.*)"
+            )
+            if path:
+                self._lexicon_path = path
+                self._sync_lex_label()
+                self._load_lexicon_silent()
+
+        def _load_lexicon_silent(self) -> None:
+            path = self._lexicon_path.strip()
+            if not path or not os.path.isfile(path):
+                self.statusBar().showMessage("Lexicon path missing or not a file.")
+                return
+            try:
+                self.gaddag = Gaddag.from_file(path)
+                self.word_set = load_words_from_file(path)
+                self.statusBar().showMessage(f"Loaded {len(self.word_set)} words from {path}")
+                self._update_preview_status()
+            except OSError as e:
+                self.statusBar().showMessage(f"Lexicon error: {e}")
+
+        def _set_cell_bonus(self, r: int, c: int, bonus_idx: int) -> None:
+            it = self._board_table.item(r, c)
+            if not it:
+                return
+            bonus_idx = max(0, min(len(BONUS_LABELS) - 1, bonus_idx))
+            it.setData(Qt.ItemDataRole.UserRole, bonus_idx)
+            it.setBackground(_bonus_brush_for_label(BONUS_LABELS[bonus_idx]))
+
+        def _board_context_menu(self, pos) -> None:
+            idx = self._board_table.indexAt(pos)
+            if not idx.isValid():
+                return
+            r, c = idx.row(), idx.column()
+            menu = QMenu(self)
+            for i, lab in enumerate(BONUS_LABELS):
+                act = QAction(lab, self)
+                act.triggered.connect(lambda checked=False, bi=i: self._set_cell_bonus(r, c, bi))
+                menu.addAction(act)
+            menu.exec(self._board_table.viewport().mapToGlobal(pos))
+
+        def _on_rack_text_changed(self, _t: str) -> None:
+            self._update_preview_status()
+
+        def _refresh_board_display(self) -> None:
+            self._board_updating = True
+            try:
+                base_font = self._board_table.font()
+                for r in range(BOARD_SIZE):
+                    for c in range(BOARD_SIZE):
+                        it = self._board_table.item(r, c)
+                        if not it:
+                            continue
+                        ch_c = self._committed_letters[r][c]
+                        nt = self._preview_tiles.get((r, c))
+                        if nt is not None:
+                            disp: str = nt.ch.lower() if nt.from_blank else nt.ch
+                            bold = True
+                        elif ch_c:
+                            disp = ch_c
+                            bold = False
+                        else:
+                            disp = ""
+                            bold = False
+                        it.setText(disp)
+                        f = QFont(base_font)
+                        f.setBold(bold)
+                        it.setFont(f)
+            finally:
+                self._board_updating = False
+            self._update_preview_status()
+
+        def _board_committed_with_bonuses(self) -> Board:
+            b = Board()
+            for r in range(BOARD_SIZE):
+                for c in range(BOARD_SIZE):
+                    b.letters[r][c] = self._committed_letters[r][c]
+                    it = self._board_table.item(r, c)
+                    raw_bonus = it.data(Qt.ItemDataRole.UserRole) if it else None
+                    bi = int(raw_bonus) if raw_bonus is not None else 0
+                    bi = max(0, min(len(BONUS_LABELS) - 1, bi))
+                    b.bonuses[r][c] = Bonus(bi)
+            return b
+
+        def _update_preview_status(self) -> None:
+            if not self._preview_tiles:
+                self._preview_score_label.setText("Preview: —")
+                return
+            if not self.word_set:
+                self._preview_score_label.setText("Preview: — (load lexicon)")
+                return
+            board = self._board_committed_with_bonuses()
+            rack = rack_from_string(self._rack_edit.text())
+            out = validate_manual_play(
+                board, list(self._preview_tiles.values()), rack, self.word_set
+            )
+            if isinstance(out, ValidatedPlay):
+                self._preview_score_label.setText(f"Preview: {out.score} points")
+            else:
+                short = out if len(out) <= 40 else out[:37] + "…"
+                self._preview_score_label.setText(f"Preview: — ({short})")
+
+        def _consume_rack_after_play(self, tiles: Sequence[NewTile]) -> None:
+            chars: List[str] = []
+            for c in self._rack_edit.text().upper().replace(" ", ""):
+                if c.isalpha() or c == "?":
+                    chars.append(c)
+            for t in tiles:
+                if t.from_blank:
+                    if "?" in chars:
+                        chars.remove("?")
+                    else:
+                        return
+                else:
+                    L = t.ch.upper()
+                    for i, x in enumerate(chars):
+                        if x == L:
+                            del chars[i]
+                            break
+                    else:
+                        return
+            self._rack_edit.setText("".join(chars))
+
+        def _commit_preview(self) -> None:
+            if not self._preview_tiles:
+                QMessageBox.information(self, "Commit", "No preview tiles to commit.")
+                return
+            if not self.word_set:
+                QMessageBox.warning(self, "Lexicon", "Load a lexicon first.")
+                return
+            board = self._board_committed_with_bonuses()
+            rack = rack_from_string(self._rack_edit.text())
+            out = validate_manual_play(
+                board, list(self._preview_tiles.values()), rack, self.word_set
+            )
+            if isinstance(out, str):
+                QMessageBox.warning(self, "Invalid play", out)
+                return
+            for t in out.new_tiles:
+                self._committed_letters[t.r][t.c] = (
+                    t.ch.lower() if t.from_blank else t.ch
+                )
+            tiles_merged = out.new_tiles
+            self._preview_tiles.clear()
+            self._consume_rack_after_play(tiles_merged)
+            self._refresh_board_display()
+
+        def _cancel_preview(self) -> None:
+            if not self._preview_tiles:
+                return
+            self._preview_tiles.clear()
+            self._refresh_board_display()
+
+        def _on_board_item_changed(self, item: QTableWidgetItem) -> None:
+            if self._board_updating:
+                return
+            r, c = item.row(), item.column()
+            txt = item.text().strip()
+            if len(txt) > 1:
+                self._board_updating = True
+                try:
+                    item.setText(txt[0])
+                finally:
+                    self._board_updating = False
+                txt = txt[0]
+            try:
+                norm: Optional[str] = normalize_board_letter(txt) if txt else None
+            except ValueError as e:
+                QMessageBox.warning(
+                    self,
+                    "Board",
+                    f"Cell ({r + 1},{chr(ord('A') + c)}): {e}",
+                )
+                self._refresh_board_display()
+                return
+
+            if self._committed_letters[r][c] is not None:
+                if norm is None:
+                    self._committed_letters[r][c] = None
+                else:
+                    self._committed_letters[r][c] = norm
+                self._preview_tiles.pop((r, c), None)
+            else:
+                if norm is None:
+                    self._preview_tiles.pop((r, c), None)
+                else:
+                    if norm.islower():
+                        self._preview_tiles[(r, c)] = NewTile(r, c, norm.upper(), True)
+                    else:
+                        self._preview_tiles[(r, c)] = NewTile(r, c, norm, False)
+            self._refresh_board_display()
+
+        def _clear_letters(self) -> None:
+            for r in range(BOARD_SIZE):
+                for c in range(BOARD_SIZE):
+                    self._committed_letters[r][c] = None
+            self._preview_tiles.clear()
+            self._refresh_board_display()
+
+        def _reset_premiums(self) -> None:
+            for r in range(BOARD_SIZE):
+                for c in range(BOARD_SIZE):
+                    self._set_cell_bonus(r, c, int(self._default_bonuses[r][c]))
+
+        def _find_moves(self) -> None:
+            if self.gaddag is None or not self.word_set:
+                QMessageBox.warning(self, "Lexicon", "Load a lexicon first.")
+                return
+            board = self._board_committed_with_bonuses()
+            topn = self._topn_spin.value()
+            rack = rack_from_string(self._rack_edit.text())
+            if not rack:
+                QMessageBox.warning(self, "Rack", "Enter rack letters (use ? for blanks).")
+                return
+            plays = find_moves(board, rack, self.gaddag, self.word_set, top_n=topn)
+            self._snapshot_letters = [
+                [self._committed_letters[r][c] for c in range(BOARD_SIZE)]
+                for r in range(BOARD_SIZE)
+            ]
+            self._plays_cache = plays
+
+            self._moves_table.setRowCount(len(plays))
+            for i, p in enumerate(plays):
+                s_item = QTableWidgetItem(str(p.score))
+                s_item.setFlags(s_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                s_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                self._moves_table.setItem(i, 0, s_item)
+                pl_item = QTableWidgetItem(p.summary())
+                pl_item.setFlags(pl_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._moves_table.setItem(i, 1, pl_item)
+                d_item = QTableWidgetItem(p.detail())
+                d_item.setFlags(d_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._moves_table.setItem(i, 2, d_item)
+            self.statusBar().showMessage(f"{len(plays)} moves (cap {topn})")
+
+        def _preview_selected_move(self) -> None:
+            if not self._plays_cache or self._snapshot_letters is None:
+                return
+            rows = self._moves_table.selectionModel().selectedRows()
+            if not rows:
+                return
+            idx = rows[0].row()
+            if idx < 0 or idx >= len(self._plays_cache):
+                return
+            play = self._plays_cache[idx]
+            conflict = False
+            for nt in play.new_tiles:
+                if self._committed_letters[nt.r][nt.c] is not None:
+                    conflict = True
+                    break
+            if conflict:
+                QMessageBox.warning(
+                    self,
+                    "Preview",
+                    "Selected move overlaps committed tiles; clear those squares first.",
+                )
+                return
+            self._preview_tiles = {(nt.r, nt.c): nt for nt in play.new_tiles}
+            self._refresh_board_display()
+
+        def _save_state(self) -> None:
+            path, _ = QFileDialog.getSaveFileName(self, "Save board", "", "JSON (*.json)")
+            if not path:
+                return
+            b = self._board_committed_with_bonuses()
+            letters = [
+                [self._committed_letters[r][c] for c in range(BOARD_SIZE)]
+                for r in range(BOARD_SIZE)
+            ]
+            bonuses = [[int(b.bonuses[r][c]) for c in range(BOARD_SIZE)] for r in range(BOARD_SIZE)]
+            data = {
+                "letters": letters,
+                "bonuses": bonuses,
+                "rack": self._rack_edit.text(),
+                "lexicon": self._lexicon_path,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.statusBar().showMessage(f"Saved {path}")
+
+        def _load_state(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load board", "", "JSON (*.json);;All (*.*)"
+            )
+            if not path or not os.path.isfile(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            letters = data.get("letters")
+            bonuses = data.get("bonuses")
+            if not isinstance(letters, list):
+                QMessageBox.critical(self, "Load", "Invalid file")
+                return
+            self._preview_tiles.clear()
+            self._board_updating = True
+            try:
+                for r in range(BOARD_SIZE):
+                    for c in range(BOARD_SIZE):
+                        it = self._board_table.item(r, c)
+                        ch: Optional[str] = None
+                        if r < len(letters) and c < len(letters[r]):
+                            raw = letters[r][c]
+                            if raw is not None and str(raw).strip():
+                                try:
+                                    ch = normalize_board_letter(str(raw).strip()[0])
+                                except ValueError:
+                                    ch = None
+                        self._committed_letters[r][c] = ch
+                        if isinstance(bonuses, list) and r < len(bonuses) and c < len(bonuses[r]):
+                            if bonuses[r][c] is not None:
+                                bi = int(bonuses[r][c])
+                                lab_i = bi if 0 <= bi < len(BONUS_LABELS) else 0
+                                it.setData(Qt.ItemDataRole.UserRole, lab_i)
+                                it.setBackground(_bonus_brush_for_label(BONUS_LABELS[lab_i]))
+            finally:
+                self._board_updating = False
+            if "rack" in data:
+                self._rack_edit.setText(str(data["rack"]))
+            if data.get("lexicon"):
+                self._lexicon_path = str(data["lexicon"])
+                self._sync_lex_label()
+                self._load_lexicon_silent()
+            self._refresh_board_display()
+            self.statusBar().showMessage(f"Loaded {path}")
 
 
 def main() -> None:
-    ScrabbleGui().run()
+    if _PYSIDE_IMPORT_ERROR is not None or ScrabbleMainWindow is None:
+        sys.stderr.write(
+            "scrabble-gui requires PySide6. Install the GUI extra, for example:\n"
+            '  pip install "scrabble-engine[gui]"\n'
+            "or from a checkout:\n"
+            '  pip install -e ".[gui]"\n'
+        )
+        raise SystemExit(1) from _PYSIDE_IMPORT_ERROR
+
+    try:
+        app = QApplication(sys.argv)
+    except Exception as exc:  # pragma: no cover
+        sys.stderr.write(
+            "scrabble-gui needs a GUI display (X11/Wayland). Qt reported:\n"
+            f"  {exc}\n\n"
+            "If you are on SSH, reconnect with X11 forwarding (e.g. ssh -Y …) "
+            "or set DISPLAY to your desktop session.\n"
+            "On a machine with no display, try: xvfb-run -a scrabble-gui\n"
+        )
+        raise SystemExit(1) from exc
+
+    win = ScrabbleMainWindow()
+    win.show()
+    raise SystemExit(app.exec())
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scrabble-engine"
 version = "0.1.0"
-description = "Scrabble move-finding engine with a tkinter GUI"
+description = "Scrabble move-finding engine with an optional Qt (PySide6) GUI"
 requires-python = ">=3.9"
 authors = [{ name = "crossplay" }]
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+gui = ["PySide6>=6.6"]
 
 [project.scripts]
 scrabble-gui = "scrabble.gui:main"

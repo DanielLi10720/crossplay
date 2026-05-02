@@ -1,14 +1,16 @@
 # Scrabble move finder
 
-Python **GADDAG**-based move generation, full **Scrabble scoring** (premiums, cross-words, bingo +50), and a **tkinter** GUI.
+Python **GADDAG**-based move generation, full **Scrabble scoring** (premiums, cross-words, bingo +50), and an optional **Qt (PySide6)** GUI.
 
 ## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev,gui]"
 ```
+
+The `gui` extra pulls in **PySide6** for `scrabble-gui`. Core library usage does not require it; use `pip install -e ".[dev]"` if you only need the engine and tests.
 
 ## GUI
 
@@ -19,9 +21,9 @@ python -m scrabble.gui
 ```
 
 - Enter **letters** in the 15×15 grid (use **lowercase** for a blank already on the board; it scores 0).
-- Set **premium** squares with each cell’s dropdown (or **Reset premiums** for the standard board).
+- Set **premium** squares via **right-click** on a cell (or **Board → Reset premiums** for the standard layout).
 - **Rack**: letters A–Z and `?` for a blank in the rack (`?` branches over A–Z but is pruned by the GADDAG).
-- Point **Lexicon** at a NASPA-style word list (one word per line). The bundled [`data/sample_words.txt`](data/sample_words.txt) is only for demos/tests — use your own **NWL** file where permitted.
+- Open a **lexicon** with **File → Open lexicon** (NASPA-style word list, one word per line). The bundled [`data/sample_words.txt`](data/sample_words.txt) is only for demos/tests — use your own **NWL** file where permitted.
 
 ## Library usage
 

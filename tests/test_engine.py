@@ -7,6 +7,7 @@ import pytest
 from scrabble.board import Bonus, Board
 from scrabble.gaddag import Gaddag, load_words_from_file
 from scrabble.move_gen import find_moves
+from scrabble.play_validate import ValidatedPlay, validate_manual_play
 from scrabble.score import NewTile, score_play
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -100,3 +101,89 @@ def test_score_rejects_board_mismatch():
     nt = (NewTile(7, 8, "I", False),)
     with pytest.raises(ValueError):
         score_play(b, "H", 7, 7, "HI", nt)
+
+
+def test_validate_opening_hi(lexicon):
+    _, words = lexicon
+    b = Board()
+    nt = (NewTile(7, 7, "H", False), NewTile(7, 8, "I", False))
+    out = validate_manual_play(b, nt, list("HI"), words)
+    assert isinstance(out, ValidatedPlay)
+    assert out.word == "HI" and out.score == 10
+
+
+def test_validate_opening_must_cover_center(lexicon):
+    _, words = lexicon
+    b = Board()
+    nt = (NewTile(0, 0, "A", False), NewTile(0, 1, "A", False))
+    out = validate_manual_play(b, nt, list("AA"), words)
+    assert isinstance(out, str) and "center" in out.lower()
+
+
+def test_validate_must_connect_to_board(lexicon):
+    _, words = lexicon
+    b = Board()
+    b.letters[0][0] = "A"
+    nt = (NewTile(7, 7, "H", False), NewTile(7, 8, "I", False))
+    out = validate_manual_play(b, nt, list("HI"), words)
+    assert isinstance(out, str) and "touch" in out.lower()
+
+
+def test_validate_cross_word_not_in_lexicon(lexicon):
+    _, words = lexicon
+    words2 = set(words)
+    words2.discard("AIT")
+    b = _all_normal_bonuses()
+    b.letters[6][7] = "A"
+    b.letters[8][7] = "T"
+    b.letters[7][6] = "H"
+    nt = (NewTile(7, 7, "I", False),)
+    out = validate_manual_play(b, nt, list("I"), words2)
+    assert isinstance(out, str) and "AIT" in out
+
+
+def test_validate_rack_mismatch(lexicon):
+    _, words = lexicon
+    b = Board()
+    nt = (NewTile(7, 7, "H", False), NewTile(7, 8, "I", False))
+    out = validate_manual_play(b, nt, list("H"), words)
+    assert isinstance(out, str) and "Rack" in out
+
+
+def test_validate_score_agrees_with_score_play(lexicon):
+    _, words = lexicon
+    b = _all_normal_bonuses()
+    b.letters[6][7] = "A"
+    b.letters[8][7] = "T"
+    b.letters[7][6] = "H"
+    nt = (NewTile(7, 7, "I", False),)
+    direct = score_play(b, "H", 7, 6, "HI", nt)
+    out = validate_manual_play(b, nt, list("I"), words)
+    assert isinstance(out, ValidatedPlay)
+    assert out.score == direct
+
+
+def test_validate_blank_from_rack(lexicon):
+    _, words = lexicon
+    b = _all_normal_bonuses()
+    nt = (NewTile(7, 7, "Z", True), NewTile(7, 8, "A", False))
+    out = validate_manual_play(b, nt, list("?A"), words)
+    assert isinstance(out, ValidatedPlay)
+    assert out.score == score_play(b, "H", 7, 7, "ZA", nt)
+
+
+def test_validate_cannot_preview_on_occupied_square(lexicon):
+    _, words = lexicon
+    b = Board()
+    b.letters[7][7] = "X"
+    nt = (NewTile(7, 7, "H", False),)
+    out = validate_manual_play(b, nt, list("H"), words)
+    assert isinstance(out, str) and "occupied" in out.lower()
+
+
+def test_validate_tiles_not_collinear(lexicon):
+    _, words = lexicon
+    b = Board()
+    nt = (NewTile(7, 7, "A", False), NewTile(8, 8, "A", False))
+    out = validate_manual_play(b, nt, list("AA"), words)
+    assert isinstance(out, str) and ("row" in out.lower() or "column" in out.lower())
